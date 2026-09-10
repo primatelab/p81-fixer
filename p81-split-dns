@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# Split DNS around Perimeter 81's UDP/53 DNAT to 127.0.0.1:5354.
+#
+# Client queries to the local stub and systemd-resolved's uplink queries are
+# fwmarked 0x81 so P81 does not steal them.
+# Corporate suffixes are routed to the p81 link DNS; everything else uses Wi-Fi DNS.
+#
+# Usage:
+#   sudo p81-split-dns apply
+#   sudo p81-split-dns status
+#   sudo p81-split-dns revert
+# NetworkManager calls: p81-split-dns --nm <iface> <action>
+#
+# Tear-out: sudo p81-split-dns revert
+#           sudo rm /etc/NetworkManager/dispatcher.d/60-p81-fixer /usr/local/sbin/p81-split-dns /usr/local/sbin/p81-drop-tproxy
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  sudo "$0" "$@"
+  exit 0
+fi
+
+set -u
+
+MARK=0x81
+COMMENT=p81-split-dns
+LOG_TAG=60-p81-fixer
+RESOLVE_UID=systemd-resolve
+STUB_ADDR=127.0.0.53
+DROP_TPROXY_BIN=/usr/local/sbin/p81-drop-tproxy
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CTL=(/usr/bin/p81-helper-daemon ctl)
+
+# P81's DNAT has no destination filter, so both legs need the bypass mark:
+# apps talking to the stub, and resolved talking to uplink servers.
+MARK_SPECS=(
+  "-p udp --dport 53 -d $STUB_ADDR"
+  "-p udp --dport 53 -m owner --uid-owner $RESOLVE_UID"
+)
+
+WARN_WIDTH=70
+if [[ -t 2 ]]; then
+  WARN_RED=$'\e[1;31m'
+  WARN_REV=$'\e[1;7;31m'
+  WARN_OFF=$'\e[0m'
+else
+  WARN_RED=''
+  WARN_REV=''
+  WARN_OFF=''
+fi
+
+log() {
+  echo "$LOG_TAG: $*"
+  logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true
+}
+
+ensure_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    echo "$LOG_TAG: need root (sudo $0 $*)" >&2
+    exit 1
+  fi
+}
+
+ensure_drop_tproxy_installed() {
+  [[ -x "$DROP_TPROXY_BIN" ]] && return 0
+  local src="$SCRIPT_DIR/p81-drop-tproxy"
+  if [[ ! -f "$src" ]]; then
+    log "cannot install p81-drop-tproxy; source missing at $src"
+    return 1
+  fi
+  install -m 0755 "$src" "$DROP_TPROXY_BIN"
+  log "installed $DROP_TPROXY_BIN from $src"
+}
+
+start_drop_tproxy_daemon() {
+  ensure_drop_tproxy_installed || return 0
+  "$DROP_TPROXY_BIN" --daemon >/dev/null 2>&1 || true
+}
+
+fetch_network_json() {
+  "${CTL[@]}" get-network 2>/dev/null || return 1
+}
+
+p81_policy_domains() {
+  command -v jq >/dev/null 2>&1 || return 1
+  local network_json domain
+  network_json=$(fetch_network_json) || return 1
+  jq -r '.attributes.customDNS.attributes.dnsPolicy.private.domains[]? // empty' <<<"$network_json" \
+    | while IFS= read -r domain; do
+        [[ -z "$domain" ]] && continue
+        [[ "$domain" == \~* ]] || domain="~$domain"
+        printf '%s\n' "$domain"
+      done
+}
+
+ipt_has_mark() {
+  iptables -w -t mangle -C OUTPUT $1 \
+    -j MARK --set-mark "$MARK" \
+    -m comment --comment "$COMMENT" 2>/dev/null
+}
+
+ensure_mark() {
+  local spec
+  for spec in "${MARK_SPECS[@]}"; do
+    ipt_has_mark "$spec" && continue
+    iptables -w -t mangle -I OUTPUT 1 $spec \
+      -j MARK --set-mark "$MARK" \
+      -m comment --comment "$COMMENT"
+    log "installed mangle OUTPUT mark $MARK for: $spec"
+  done
+}
+
+drop_mark() {
+  local spec
+  for spec in "${MARK_SPECS[@]}"; do
+    while ipt_has_mark "$spec"; do
+      iptables -w -t mangle -D OUTPUT $spec \
+        -j MARK --set-mark "$MARK" \
+        -m comment --comment "$COMMENT"
+    done
+  done
+  log "removed mangle OUTPUT mark rules"
+}
+
+tproxy_rules() {
+  iptables -w -t mangle -S 2>/dev/null | grep -- '-j TPROXY'
+}
+
+# TPROXY hands TCP to P81's gateway regardless of DNS, so say so loudly.
+warn_tproxy() {
+  local rules line
+  rules=$(tproxy_rules) || return 0
+
+  local banner=(
+    ''
+    '  ###  WARNING: PERIMETER 81 TPROXY INTERCEPTION IS ACTIVE  ###'
+    ''
+    '  TCP traffic is transparently redirected into the P81 secure web'
+    '  gateway, which terminates and inspects it. Split DNS does NOT'
+    '  prevent this. Assume every TCP connection is being read.'
+    ''
+  )
+
+  echo >&2
+  for line in "${banner[@]}"; do
+    printf '%s%-*s%s\n' "$WARN_REV" "$WARN_WIDTH" "$line" "$WARN_OFF" >&2
+  done
+  while IFS= read -r line; do
+    printf '%s    %s%s\n' "$WARN_RED" "$line" "$WARN_OFF" >&2
+  done <<< "$rules"
+  printf '%s%-*s%s\n' "$WARN_REV" "$WARN_WIDTH" '' "$WARN_OFF" >&2
+  echo >&2
+}
+
+wifi_dev() {
+  nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null \
+    | awk -F: '$2=="wifi" && $3=="connected" { print $1; exit }'
+}
+
+wifi_con() {
+  local dev="$1"
+  nmcli -t -f DEVICE,CONNECTION device status 2>/dev/null \
+    | awk -F: -v d="$dev" '$1==d { print $2; exit }'
+}
+
+p81_up() {
+  ip -o link show p81 >/dev/null 2>&1 || return 1
+  ip -4 -o addr show p81 2>/dev/null | grep -q ' inet '
+}
+
+p81_dns() {
+  local ips
+  ips=$(resolvectl dns p81 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i}')
+  if [[ -n "$ips" ]]; then
+    printf '%s\n' $ips
+    return
+  fi
+  local addr
+  addr=$(ip -4 -o addr show p81 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+  if [[ "$addr" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+    echo "${BASH_REMATCH[1]}.1"
+    return
+  fi
+  echo 10.254.0.1
+}
+
+is_p81_dns() {
+  [[ "$1" == 10.254.* ]]
+}
+
+wifi_dns_list() {
+  local dev="$1" con="$2" raw ip
+  raw=$(nmcli -g IP4.DNS device show "$dev" 2>/dev/null | tr '|' '\n')
+  if [[ -z "${raw// /}" && -n "$con" ]]; then
+    raw=$(nmcli -g ipv4.dns connection show "$con" 2>/dev/null | tr ',' '\n')
+  fi
+  local out=()
+  while IFS= read -r ip; do
+    ip=${ip// /}
+    [[ -z "$ip" ]] && continue
+    is_p81_dns "$ip" && continue
+    out+=("$ip")
+  done <<< "$raw"
+  if [[ ${#out[@]} -eq 0 ]]; then
+    out=(1.1.1.1 8.8.8.8)
+  fi
+  printf '%s\n' "${out[@]}"
+}
+
+apply_split() {
+  start_drop_tproxy_daemon
+  ensure_mark
+  local wifi con
+  wifi=$(wifi_dev)
+  if [[ -z "$wifi" ]]; then
+    log "no connected wifi; mark rule only"
+    return 0
+  fi
+  con=$(wifi_con "$wifi")
+  mapfile -t wdns < <(wifi_dns_list "$wifi" "$con")
+
+  resolvectl default-route "$wifi" yes >/dev/null
+  resolvectl dns "$wifi" "${wdns[@]}" >/dev/null
+  log "wifi $wifi dns ${wdns[*]}"
+
+  if p81_up; then
+    mapfile -t pdns < <(p81_dns)
+    mapfile -t domains < <(p81_policy_domains || true)
+    resolvectl default-route p81 no >/dev/null
+    resolvectl dns p81 "${pdns[@]}" >/dev/null
+    if [[ ${#domains[@]} -gt 0 ]]; then
+      resolvectl domain p81 "${domains[@]}" >/dev/null
+      log "p81 dns ${pdns[*]} corp ${#domains[@]} suffixes (live policy)"
+    else
+      resolvectl domain p81 '' >/dev/null 2>&1 || true
+      log "p81 dns ${pdns[*]} no corp suffixes from live policy"
+    fi
+  else
+    resolvectl domain p81 '' >/dev/null 2>&1 || true
+    log "p81 down; corp suffixes cleared"
+  fi
+}
+
+revert_split() {
+  drop_mark
+  resolvectl domain p81 '' >/dev/null 2>&1 || true
+  local wifi
+  wifi=$(wifi_dev)
+  if [[ -n "$wifi" ]]; then
+    resolvectl revert "$wifi" >/dev/null 2>&1 || true
+    log "reverted resolved on $wifi"
+  fi
+}
+
+show_status() {
+  echo "=== mark rules ==="
+  local spec
+  for spec in "${MARK_SPECS[@]}"; do
+    if ipt_has_mark "$spec"; then
+      echo "present: $spec"
+    else
+      echo "absent:  $spec"
+    fi
+  done
+  echo
+  echo "=== p81 link ==="
+  if p81_up; then
+    echo "up  dns: $(p81_dns | tr '\n' ' ')"
+  else
+    echo "down"
+  fi
+  echo
+  echo "=== p81 tcp interception ==="
+  if tproxy_rules >/dev/null; then
+    warn_tproxy
+  else
+    echo "absent"
+  fi
+  echo
+  resolvectl status
+}
+
+nm_dispatch() {
+  local iface="${1:-}" action="${2:-}"
+  case "$action" in
+    up|down|vpn-up|vpn-down|dhcp4-change|dhcp6-change|connectivity-change|dns-change)
+      apply_split
+      ;;
+    *)
+      ;;
+  esac
+}
+
+cmd="${1:-apply}"
+case "$cmd" in
+  --nm)
+    ensure_root
+    nm_dispatch "${2:-}" "${3:-}"
+    ;;
+  apply)
+    ensure_root
+    apply_split
+    warn_tproxy
+    ;;
+  revert)
+    ensure_root
+    revert_split
+    ;;
+  status)
+    show_status
+    ;;
+  *)
+    echo "Usage: $0 apply|status|revert" >&2
+    exit 2
+    ;;
+esac

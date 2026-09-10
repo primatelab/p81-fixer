@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Delete Perimeter 81 TPROXY rules as they reappear.
+#
+# P81's helper rebuilds the NetFilter2 chains on nf_setRules (reconnect,
+# sleep/resume, policy refresh). This loop removes TPROXY after each rebuild.
+#
+# Usage:
+#   sudo p81-drop-tproxy           # foreground
+#   sudo p81-drop-tproxy --daemon  # background (pid /run/p81-drop-tproxy.pid)
+#   sudo p81-drop-tproxy stop      # stop daemon
+
+set -u
+
+INTERVAL=0.1
+PIDFILE=/run/p81-drop-tproxy.pid
+LOGFILE=/var/log/p81-drop-tproxy.log
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  # echo "p81-drop-tproxy: need root (sudo $0)" >&2
+  # exit 1
+  sudo $0 $@
+  exit 0
+fi
+
+drop_tproxy() {
+  local cmd line parts
+  for cmd in iptables ip6tables; do
+    command -v "$cmd" >/dev/null 2>&1 || continue
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      read -r -a parts <<< "$line"
+      [[ ${parts[0]:-} == -A ]] || continue
+      if "$cmd" -w -t mangle -D "${parts[@]:1}"; then
+        echo "p81-drop-tproxy: deleted ($cmd): $line"
+        logger -t p81-drop-tproxy -- "deleted ($cmd): $line" 2>/dev/null || true
+      fi
+    done < <("$cmd" -w -t mangle -S 2>/dev/null | grep -- '-j TPROXY' || true)
+  done
+}
+
+running_pid() {
+  local pid
+  [[ -f $PIDFILE ]] || return 1
+  pid=$(cat "$PIDFILE")
+  [[ -n $pid ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  --daemon)
+    if pid=$(running_pid); then
+      echo "p81-drop-tproxy: already running (pid $pid)" >&2
+      exit 1
+    fi
+    nohup "$0" >>"$LOGFILE" 2>&1 &
+    echo $! >"$PIDFILE"
+    echo "p81-drop-tproxy: daemon pid $! (log $LOGFILE)"
+    exit 0
+    ;;
+  stop)
+    if pid=$(running_pid); then
+      kill "$pid"
+      rm -f "$PIDFILE"
+      echo "p81-drop-tproxy: stopped pid $pid"
+    else
+      rm -f "$PIDFILE"
+      echo "p81-drop-tproxy: not running"
+    fi
+    exit 0
+    ;;
+  '' )
+    ;;
+  *)
+    echo "Usage: $0 [--daemon|stop]" >&2
+    exit 2
+    ;;
+esac
+
+echo "p81-drop-tproxy: watching mangle for TPROXY every ${INTERVAL}s"
+while true; do
+  drop_tproxy
+  sleep "$INTERVAL"
+done

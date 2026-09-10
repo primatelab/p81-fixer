@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Print Harmony SASE split-tunnel destinations and test if a URL/host/IP
+# is routed via the VPN (p81) or stays local.
+set -euo pipefail
+
+CTL=(sudo -n /usr/bin/p81-helper-daemon ctl)
+VPN_IFACE=p81
+
+die() { echo -e "\n\e[1;31merror:\e[39m $* \e[39m\n" >&2; exit 2; }
+
+need() { command -v "$1" >/dev/null || die "'$1' is required"; }
+
+need jq
+need getent
+need ip
+
+ipv4_to_int() {
+  local a b c d
+  IFS=. read -r a b c d <<<"$1" || return 1
+  [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+  ((a <= 255 && b <= 255 && c <= 255 && d <= 255)) || return 1
+  echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+cidr_contains() {
+  # cidr_contains <ip> <cidr>
+  local ip="$1" cidr="$2" base bits ip_i base_i mask
+  [[ "$cidr" == */* ]] || cidr="${cidr}/32"
+  base="${cidr%/*}"
+  bits="${cidr#*/}"
+  [[ "$bits" =~ ^[0-9]+$ ]] || return 1
+  ((bits >= 0 && bits <= 32)) || return 1
+  ip_i=$(ipv4_to_int "$ip") || return 1
+  base_i=$(ipv4_to_int "$base") || return 1
+  if ((bits == 0)); then
+    return 0
+  fi
+  mask=$(( 0xFFFFFFFF << (32 - bits) & 0xFFFFFFFF ))
+  (( (ip_i & mask) == (base_i & mask) ))
+}
+
+is_private_cidr() {
+  local base="${1%/*}"
+  local a=${base%%.*}
+  case "$a" in
+    10) return 0 ;;
+    172)
+      local b
+      b=$(cut -d. -f2 <<<"$base")
+      ((b >= 16 && b <= 31)) && return 0
+      return 1
+      ;;
+    192)
+      [[ "$base" == 192.168.* ]] && return 0
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+host_from_target() {
+  local t="$1"
+  t="${t#*://}"
+  t="${t%%/*}"
+  t="${t%%\?*}"
+  t="${t%%#*}"
+  # host:port (not bare IPv6)
+  if [[ "$t" == *:* && "$t" != *:*:* && "$t" != \[* ]]; then
+    t="${t%:*}"
+  fi
+  t="${t#[}"
+  t="${t%]}"
+  printf '%s' "$t"
+}
+
+is_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ipv4_to_int "$1" >/dev/null
+}
+
+fetch_network_json() {
+  "${CTL[@]}" get-network 2>/dev/null || die "failed to get network policy (is the agent running?)"
+}
+
+fetch_vpn_status_json() {
+  "${CTL[@]}" vpn-status 2>/dev/null || true
+}
+
+count_private() {
+  local n=0 c
+  for c in "$@"; do
+    is_private_cidr "$c" && ((n++)) || true
+  done
+  echo "$n"
+}
+
+print_summary() {
+  local net status
+  net=$(fetch_network_json)
+  status=$(fetch_vpn_status_json)
+  NETWORK_JSON="$net"
+
+  echo "Network: $(jq -r '.name // "?"' <<<"$net")"
+  if [[ -n "$status" ]]; then
+    echo "VPN status: $(jq -r '.Status // "?"' <<<"$status")"
+    echo "Split tunneling: $(jq -r '.SplitTunneling // "?"' <<<"$status")  Private DNS: $(jq -r '.PrivateDns // "?"' <<<"$status")  Always On: $(jq -r '.AlwaysOn // "?"' <<<"$status")"
+  fi
+
+  local excl enabled
+  enabled=$(jq -r '.attributes.splitTunneling.enabled // false' <<<"$net")
+  excl=$(jq -r '.attributes.splitTunneling.attributes.exclusionMode // false' <<<"$net")
+  if [[ "$excl" == "true" ]]; then
+    echo "Policy mode: exclusion (listed CIDRs stay local; rest via VPN)"
+  else
+    echo "Policy mode: include-only (only listed CIDRs via VPN; rest local)"
+  fi
+  echo "Split tunneling enabled: $enabled"
+
+  local cidrs=()
+  mapfile -t cidrs < <(jq -r '.attributes.splitTunneling.attributes.cidr[]?' <<<"$net")
+  local priv_n pub_n
+  priv_n=$(count_private "${cidrs[@]}")
+  pub_n=$((${#cidrs[@]} - priv_n))
+
+  echo
+  echo "Private ranges ($priv_n)"
+  local c
+  for c in "${cidrs[@]}"; do
+    is_private_cidr "$c" && echo "  $c"
+  done
+  echo
+  echo "Public / cloud hosts ($pub_n)"
+  for c in "${cidrs[@]}"; do
+    is_private_cidr "$c" || echo "  $c"
+  done
+
+  echo
+  echo "Corporate DNS servers"
+  jq -r '.attributes.customDNS.attributes.servers[]?.address // empty' <<<"$net" | sed 's/^/  /'
+  echo
+  echo "Domains using corporate DNS"
+  jq -r '.attributes.customDNS.attributes.dnsPolicy.private.domains[]? // empty' <<<"$net" | sort | sed 's/^/  /'
+}
+
+policy_match() {
+  local ip="$1" c
+  for c in "${CIDRS[@]}"; do
+    if cidr_contains "$ip" "$c"; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+live_dev() {
+  ip route get "$1" 2>/dev/null | awk '{
+    for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }
+  }'
+}
+
+domain_matches_private_dns() {
+  local host="$1" d
+  for d in "${DNS_DOMAINS[@]}"; do
+    [[ "$host" == "$d" || "$host" == *."$d" ]] && return 0
+  done
+  return 1
+}
+
+load_policy() {
+  NETWORK_JSON=$(fetch_network_json)
+  mapfile -t CIDRS < <(jq -r '.attributes.splitTunneling.attributes.cidr[]?' <<<"$NETWORK_JSON")
+  mapfile -t DNS_DOMAINS < <(jq -r '.attributes.customDNS.attributes.dnsPolicy.private.domains[]? // empty' <<<"$NETWORK_JSON")
+}
+
+check_target() {
+  local raw="$1"
+  local host
+  host=$(host_from_target "$raw")
+  if [[ -z "$host" ]]; then
+    echo -e "\n=== Check: $raw ==="
+    echo -e "\e[1;31merror:\e[0m empty host"
+    return 2
+  fi
+
+  echo
+  echo "=== Check: $raw ==="
+  echo -e "Host: \e[1m${host}\e[0m"
+
+  if domain_matches_private_dns "$host"; then
+    echo -e "Corporate DNS domain: \e[1myes\e[0m"
+  else
+    echo -e "Corporate DNS domain: \e[1mno\e[0m"
+  fi
+
+  local ips=()
+  if is_ipv4 "$host"; then
+    ips=("$host")
+  else
+    mapfile -t ips < <(getent ahostsv4 "$host" 2>/dev/null | awk '{ print $1 }' | awk '!seen[$0]++')
+    if ((${#ips[@]} == 0)) && command -v dig >/dev/null; then
+      local dns_srv
+      while read -r dns_srv; do
+        [[ -z "$dns_srv" ]] && continue
+        mapfile -t ips < <(dig +short +time=2 +tries=1 @"$dns_srv" "$host" A 2>/dev/null | awk '/^[0-9]+\./ { print $1 }' | awk '!seen[$0]++')
+        ((${#ips[@]} > 0)) && break
+      done < <(jq -r '.attributes.customDNS.attributes.servers[]?.address // empty' <<<"$NETWORK_JSON")
+      ((${#ips[@]} > 0)) && echo "Resolved via corporate DNS"
+    fi
+    if ((${#ips[@]} == 0)); then
+      echo -e "\e[1;31merror:\e[0m could not resolve IPv4 for '$host'"
+      return 2
+    fi
+  fi
+
+  local any_vpn=0
+  local ip matched dev
+  for ip in "${ips[@]}"; do
+    if matched=$(policy_match "$ip"); then
+      :
+    else
+      matched="(none)"
+    fi
+    dev=$(live_dev "$ip" || true)
+    if [[ "$matched" != "(none)" ]]; then
+      printf '  %s  policy=VPN(%s)' "$ip" "$matched"
+      any_vpn=1
+    else
+      printf '  %s  policy=local' "$ip"
+    fi
+    if [[ "$dev" == "$VPN_IFACE" ]]; then
+      echo "  live=VPN($VPN_IFACE)"
+      any_vpn=1
+    elif [[ -n "$dev" ]]; then
+      echo "  live=local($dev)"
+    else
+      echo "  live=unknown"
+    fi
+  done
+
+  if ((any_vpn)); then
+    echo -e "\e[1mResult: \e[35mVPN\e[0m"
+    return 1
+  fi
+  echo -e "\e[1mResult: \e[36mLocal\e[0m"
+  return 0
+}
+
+main() {
+  if (($# == 0)); then
+    print_summary
+    exit 0
+  fi
+
+  load_policy
+
+  local any_vpn=0 any_err=0 target rc
+  for target in "$@"; do
+    rc=0
+    check_target "$target" || rc=$?
+    if ((rc == 1)); then
+      any_vpn=1
+    elif ((rc >= 2)); then
+      any_err=1
+    fi
+  done
+  echo
+
+  if ((any_err)); then
+    exit 2
+  fi
+  if ((any_vpn)); then
+    exit 1
+  fi
+  exit 0
+}
+
+main "$@"
