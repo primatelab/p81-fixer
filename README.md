@@ -2,7 +2,7 @@
 
 Perimeter 81 (Harmony SASE) crashes the local DNS resolver. This stops that.
 
-On Linux, P81 DNATs UDP/53 to a helper on `127.0.0.1:5354` with no destination filter. Client queries to systemd-resolved's stub, and resolved's own uplink queries, both get stolen. The stub and the helper then fight until name resolution falls over — often every few minutes.
+On Linux, P81 DNATs UDP/53 to a helper on `127.0.0.1:5354` with no destination filter. Client queries to systemd-resolved's stub, and resolved's own uplink queries, both get stolen. The stub and the helper then fight until name resolution falls over - often every few minutes.
 
 p81-fixer marks stub and uplink DNS (`0x81`) so P81 cannot intercept those packets, then restores split DNS: corporate suffixes from the live P81 policy go to the `p81` link; everything else uses the Wi-Fi resolver. A NetworkManager dispatcher reapplies this when links change.
 
@@ -12,7 +12,7 @@ That is the point of the software.
 
 Any anti-bossware capabilities are *totally* accidental side effects of the fix.
 
-In particular, while keeping DNS alive, P81's transparent TPROXY rules (TCP redirected into a secure web gateway that terminates and inspects it) may also disappear shortly after the helper puts them back. Nobody asked for that. It just happens to be adjacent to the DNS problem. The dude who actually wrote this was only trying to resolve hostnames. Workplace surveillance circumvention was not on the ticket, is not a feature, and we decline to discuss it further.
+In particular, while keeping DNS alive, P81's transparent TPROXY rules (TCP redirected into a secure web gateway that terminates and inspects it) may also disappear shortly after the helper puts them back. Nobody asked for that. It just happens to be adjacent to the DNS problem. The dude who actually wrote this was only trying to resolve hostnames. Workplace surveillance circumvention was not on the ticket, is not a feature, and the author has no idea how to get the fix working without it.
 
 ## Install
 
@@ -54,4 +54,4 @@ sudo rm /etc/NetworkManager/dispatcher.d/60-p81-fixer \
 
 ## License
 
-[HIFFL](LICENSE) — held for a friend.
+[HIFFL](LICENSE) - held for a friend.

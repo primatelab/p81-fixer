@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-## This stuff is anti-bossware, so use at own risk ###
-## These scripts circumvent p81's surveillance features, AND stop it crashing your DNS resolver every 5 minutes. ##
+### This software is (unintentionally and unavoidably) anti-bossware, so use at own risk.  ###
+### These scripts stop Perimeter81 crashing your DNS resolver every 5 minutes.             ###
+### Unfortunately, it has to circumvent corporate surveillance features in order to do so. ###
 
 set -euo pipefail
 
