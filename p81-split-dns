@@ -4,6 +4,7 @@
 # Client queries to the local stub and systemd-resolved's uplink queries are
 # fwmarked 0x81 so P81 does not steal them.
 # Corporate suffixes are routed to the p81 link DNS; everything else uses Wi-Fi DNS.
+# Extra suffixes are read from /etc/Perimeter81/fixer/localdomains.
 #
 # Usage:
 #   sudo p81-split-dns apply
@@ -29,6 +30,7 @@ STUB_ADDR=127.0.0.53
 DROP_TPROXY_BIN=/usr/local/sbin/p81-drop-tproxy
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CTL=(/usr/bin/p81-helper-daemon ctl)
+LOCAL_DOMAINS_FILE=/etc/Perimeter81/fixer/localdomains
 
 # P81's DNAT has no destination filter, so both legs need the bypass mark:
 # apps talking to the stub, and resolved talking to uplink servers.
@@ -90,6 +92,23 @@ p81_policy_domains() {
         [[ "$domain" == \~* ]] || domain="~$domain"
         printf '%s\n' "$domain"
       done
+}
+
+append_local_routing_domains() {
+  local extra existing have
+  [[ -f "$LOCAL_DOMAINS_FILE" ]] || return 0
+  while IFS= read -r extra || [[ -n "$extra" ]]; do
+    extra=${extra%%#*}
+    extra=${extra#"${extra%%[![:space:]]*}"}
+    extra=${extra%"${extra##*[![:space:]]}"}
+    [[ -z "$extra" ]] && continue
+    [[ "$extra" == \~* ]] || extra="~$extra"
+    have=0
+    for existing in "${domains[@]}"; do
+      [[ "$existing" == "$extra" ]] && have=1 && break
+    done
+    [[ $have -eq 0 ]] && domains+=("$extra")
+  done < "$LOCAL_DOMAINS_FILE"
 }
 
 ipt_has_mark() {
@@ -225,11 +244,14 @@ apply_split() {
   if p81_up; then
     mapfile -t pdns < <(p81_dns)
     mapfile -t domains < <(p81_policy_domains || true)
+    if [[ ${#domains[@]} -gt 0 ]]; then
+      append_local_routing_domains
+    fi
     resolvectl default-route p81 no >/dev/null
     resolvectl dns p81 "${pdns[@]}" >/dev/null
     if [[ ${#domains[@]} -gt 0 ]]; then
       resolvectl domain p81 "${domains[@]}" >/dev/null
-      log "p81 dns ${pdns[*]} corp ${#domains[@]} suffixes (live policy)"
+      log "p81 dns ${pdns[*]} corp ${#domains[@]} suffixes (live policy + local pins)"
     else
       resolvectl domain p81 '' >/dev/null 2>&1 || true
       log "p81 dns ${pdns[*]} no corp suffixes from live policy"

@@ -13,6 +13,8 @@ fi
 SRC_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 TARGET_DIR=/usr/local/sbin
 DISPATCHER_DIR=/etc/NetworkManager/dispatcher.d
+LOCAL_DIR=/etc/Perimeter81/fixer
+LOCAL_DOMAINS=$LOCAL_DIR/localdomains
 
 install -m 0755 "$SRC_DIR/p81-split-dns" "$TARGET_DIR/p81-split-dns"
 install -m 0755 "$SRC_DIR/p81-routes" "$TARGET_DIR/p81-routes"
@@ -27,8 +29,18 @@ EOF
 
 chmod 0755 "$DISPATCHER_DIR/60-p81-fixer"
 
+install -d -m 0755 "$LOCAL_DIR"
+if [[ ! -e "$LOCAL_DOMAINS" ]]; then
+  cat >"$LOCAL_DOMAINS" <<'EOF'
+# Extra DNS suffixes pinned to the p81 link, in addition to the live policy.
+# One suffix per line. A leading ~ is optional. Blank lines and # comments are ignored.
+EOF
+  chmod 0644 "$LOCAL_DOMAINS"
+fi
+
 echo "Installed:"
 echo "  /usr/local/sbin/p81-split-dns"
 echo "  /usr/local/sbin/p81-routes"
 echo "  /usr/local/sbin/p81-drop-tproxy"
 echo "  /etc/NetworkManager/dispatcher.d/60-p81-fixer"
+echo "  $LOCAL_DOMAINS"
