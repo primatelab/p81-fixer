@@ -13,7 +13,7 @@
 # NetworkManager calls: p81-split-dns --nm <iface> <action>
 #
 # Tear-out: sudo p81-split-dns revert
-#           sudo rm /etc/NetworkManager/dispatcher.d/60-p81-fixer /usr/local/sbin/p81-split-dns /usr/local/sbin/p81-drop-tproxy
+#           sudo rm /etc/NetworkManager/dispatcher.d/60-p81-fixer /usr/local/sbin/p81-split-dns /usr/local/sbin/p81-drop-tproxy /usr/local/sbin/p81-watch-helper
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   sudo "$0" "$@"
@@ -28,6 +28,7 @@ LOG_TAG=60-p81-fixer
 RESOLVE_UID=systemd-resolve
 STUB_ADDR=127.0.0.53
 DROP_TPROXY_BIN=/usr/local/sbin/p81-drop-tproxy
+WATCH_HELPER_BIN=/usr/local/sbin/p81-watch-helper
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CTL=(/usr/bin/p81-helper-daemon ctl)
 LOCAL_DOMAINS_FILE=/etc/Perimeter81/fixer/localdomains
@@ -76,6 +77,11 @@ ensure_drop_tproxy_installed() {
 start_drop_tproxy_daemon() {
   ensure_drop_tproxy_installed || return 0
   "$DROP_TPROXY_BIN" --daemon >/dev/null 2>&1 || true
+}
+
+start_watch_helper() {
+  [[ -x "$WATCH_HELPER_BIN" ]] || return 0
+  "$WATCH_HELPER_BIN" --daemon >/dev/null 2>&1 || true
 }
 
 fetch_network_json() {
@@ -227,6 +233,7 @@ wifi_dns_list() {
 
 apply_split() {
   start_drop_tproxy_daemon
+  start_watch_helper
   ensure_mark
   local wifi con
   wifi=$(wifi_dev)

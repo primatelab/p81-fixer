@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Kill p81daemonhelper when it hogs memory or CPU.
+#
+# RSS is checked every sample. CPU is the recent share of one core, and the
+# process is killed only after cpu_strikes samples in a row over cpu_pct.
+# Limits are read from /etc/Perimeter81/fixer/helper-limits on each sample.
+#
+# Usage:
+#   sudo p81-watch-helper           # foreground
+#   sudo p81-watch-helper --daemon  # background (pid /run/p81-watch-helper.pid)
+#   sudo p81-watch-helper status
+#   sudo p81-watch-helper stop
+
+set -u
+
+PIDFILE=/run/p81-watch-helper.pid
+LOGFILE=/var/log/p81-watch-helper.log
+LIMITS_FILE=/etc/Perimeter81/fixer/helper-limits
+HELPER_NAME=p81daemonhelper
+CLK_TCK=$(getconf CLK_TCK)
+
+RSS_LIMIT_MB=1024
+CPU_LIMIT_PCT=80
+CPU_STRIKES=3
+INTERVAL=5
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  sudo "$0" "$@"
+  exit 0
+fi
+
+log() {
+  echo "p81-watch-helper: $*"
+  logger -t p81-watch-helper -- "$*" 2>/dev/null || true
+}
+
+load_limits() {
+  RSS_LIMIT_MB=1024
+  CPU_LIMIT_PCT=80
+  CPU_STRIKES=3
+  INTERVAL=5
+  [[ -f "$LIMITS_FILE" ]] || return 0
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%%#*}
+    [[ "$line" =~ ^[[:space:]]*([a-z_]+)[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$ ]] || continue
+    key=${BASH_REMATCH[1]}
+    val=${BASH_REMATCH[2]}
+    case "$key" in
+      rss_mb) RSS_LIMIT_MB=$val ;;
+      cpu_pct) CPU_LIMIT_PCT=$val ;;
+      cpu_strikes) CPU_STRIKES=$val ;;
+      interval) INTERVAL=$val ;;
+    esac
+  done < "$LIMITS_FILE"
+  [[ "$INTERVAL" -ge 1 ]] || INTERVAL=5
+  [[ "$CPU_STRIKES" -ge 1 ]] || CPU_STRIKES=1
+}
+
+helper_pids() {
+  local pid exe
+  for pid in $(pgrep -x "$HELPER_NAME" 2>/dev/null || true); do
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    [[ "$exe" == */$HELPER_NAME ]] || continue
+    [[ "$pid" -eq $$ ]] && continue
+    echo "$pid"
+  done
+}
+
+proc_rss_kb() {
+  awk '/^VmRSS:/ { print $2; found=1 } END { if (!found) exit 1 }' "/proc/$1/status"
+}
+
+proc_ticks() {
+  local stat rest
+  stat=$(<"/proc/$1/stat") || return 1
+  rest=${stat#*)}
+  awk '{ print $12 + $13 }' <<<"$rest"
+}
+
+cpu_pct() {
+  local delta=$1 elapsed_ns=$2
+  awk -v d="$delta" -v hz="$CLK_TCK" -v ns="$elapsed_ns" 'BEGIN {
+    if (hz <= 0 || ns <= 0) { print 0; exit }
+    printf "%.0f", (d / hz) / (ns / 1000000000) * 100
+  }'
+}
+
+kill_helper() {
+  local pid=$1 reason=$2 i
+  log "killing pid $pid: $reason"
+  kill -TERM -- "$pid" 2>/dev/null || return 0
+  for i in 1 2 3 4 5; do
+    kill -0 -- "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  if kill -0 -- "$pid" 2>/dev/null; then
+    kill -KILL -- "$pid" 2>/dev/null || true
+    log "sent SIGKILL to pid $pid"
+  fi
+}
+
+running_pid() {
+  local pid
+  [[ -f $PIDFILE ]] || return 1
+  pid=$(<"$PIDFILE")
+  [[ -n $pid ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+watch_once() {
+  local pid rss_kb rss_mb ticks now_ns delta elapsed pct strikes reason
+  load_limits
+  declare -A seen=()
+  local -n _last_ticks=$1
+  local -n _last_ns=$2
+  local -n _strikes=$3
+
+  while read -r pid; do
+    [[ -z "$pid" ]] && continue
+    seen[$pid]=1
+    rss_kb=$(proc_rss_kb "$pid" 2>/dev/null || true)
+    [[ -n "$rss_kb" ]] || continue
+    rss_mb=$((rss_kb / 1024))
+    if (( rss_mb >= RSS_LIMIT_MB )); then
+      kill_helper "$pid" "rss ${rss_mb}MB >= ${RSS_LIMIT_MB}MB"
+      unset "_last_ticks[$pid]" "_last_ns[$pid]" "_strikes[$pid]"
+      continue
+    fi
+
+    ticks=$(proc_ticks "$pid" 2>/dev/null || true)
+    now_ns=$(date +%s%N)
+    [[ -n "$ticks" && -n "$now_ns" ]] || continue
+    if [[ -n ${_last_ticks[$pid]:-} && -n ${_last_ns[$pid]:-} ]]; then
+      delta=$((ticks - _last_ticks[$pid]))
+      elapsed=$((now_ns - _last_ns[$pid]))
+      if (( delta < 0 || elapsed <= 0 )); then
+        _strikes[$pid]=0
+      else
+        pct=$(cpu_pct "$delta" "$elapsed")
+        if (( pct >= CPU_LIMIT_PCT )); then
+          strikes=$((${_strikes[$pid]:-0} + 1))
+        else
+          strikes=0
+        fi
+        _strikes[$pid]=$strikes
+        if (( strikes >= CPU_STRIKES )); then
+          reason="cpu ${pct}% >= ${CPU_LIMIT_PCT}% for ${strikes} samples (rss ${rss_mb}MB)"
+          kill_helper "$pid" "$reason"
+          unset "_last_ticks[$pid]" "_last_ns[$pid]" "_strikes[$pid]"
+          continue
+        fi
+      fi
+    else
+      _strikes[$pid]=0
+    fi
+    _last_ticks[$pid]=$ticks
+    _last_ns[$pid]=$now_ns
+  done < <(helper_pids)
+
+  if ((${#_last_ticks[@]})); then
+    for pid in "${!_last_ticks[@]}"; do
+      [[ -n ${seen[$pid]:-} ]] && continue
+      unset "_last_ticks[$pid]" "_last_ns[$pid]" "_strikes[$pid]"
+    done
+  fi
+}
+
+show_status() {
+  local pid rss_kb rss_mb ticks1 ticks2 now1 now2
+  load_limits
+  echo "limits: rss>=${RSS_LIMIT_MB}MB  cpu>=${CPU_LIMIT_PCT}% of one core for ${CPU_STRIKES} samples  every ${INTERVAL}s"
+  if pid=$(running_pid); then
+    echo "watcher: pid $pid"
+  else
+    echo "watcher: not running"
+  fi
+  local found=0
+  while read -r pid; do
+    [[ -z "$pid" ]] && continue
+    found=1
+    rss_kb=$(proc_rss_kb "$pid" 2>/dev/null || true)
+    [[ -n "$rss_kb" ]] || continue
+    rss_mb=$((rss_kb / 1024))
+    ticks1=$(proc_ticks "$pid")
+    now1=$(date +%s%N)
+    sleep 1
+    ticks2=$(proc_ticks "$pid" 2>/dev/null || echo "$ticks1")
+    now2=$(date +%s%N)
+    echo "helper pid $pid  rss ${rss_mb}MB  cpu $(cpu_pct "$((ticks2 - ticks1))" "$((now2 - now1))")% over 1s"
+  done < <(helper_pids)
+  [[ "$found" -eq 1 ]] || echo "helper: not running"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  --daemon)
+    if pid=$(running_pid); then
+      echo "p81-watch-helper: already running (pid $pid)" >&2
+      exit 0
+    fi
+    nohup "$0" >>"$LOGFILE" 2>&1 &
+    echo $! >"$PIDFILE"
+    echo "p81-watch-helper: daemon pid $! (log $LOGFILE)"
+    exit 0
+    ;;
+  stop)
+    if pid=$(running_pid); then
+      kill "$pid"
+      rm -f "$PIDFILE"
+      echo "p81-watch-helper: stopped pid $pid"
+    else
+      rm -f "$PIDFILE"
+      echo "p81-watch-helper: not running"
+    fi
+    exit 0
+    ;;
+  status)
+    show_status
+    exit 0
+    ;;
+  '')
+    ;;
+  *)
+    echo "Usage: $0 [--daemon|status|stop]" >&2
+    exit 2
+    ;;
+esac
+
+declare -A last_ticks=() last_ns=() cpu_strikes=()
+load_limits
+log "watching $HELPER_NAME rss>=${RSS_LIMIT_MB}MB or cpu>=${CPU_LIMIT_PCT}% for ${CPU_STRIKES} samples every ${INTERVAL}s"
+while true; do
+  watch_once last_ticks last_ns cpu_strikes
+  load_limits
+  sleep "$INTERVAL"
+done
